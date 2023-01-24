@@ -1,0 +1,232 @@
+package main
+
+import (
+	"bytes"
+	"encoding/csv"
+	"fmt"
+	"log"
+	"os"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	inputFileName      = "exam12/input.txt"
+	outputFileName     = "exam12/output.txt"
+	csvFieldsPerRecord = 6
+	maxN               = 10000
+	minLenName         = 1
+	maxLenName         = 15
+	minDateOfBirth     = "01.01.1950"
+	maxDateOfBirth     = "31.12.2021"
+	nWorker            = 4
+)
+
+type ioBufType struct {
+	inBuf  []byte
+	outBuf []byte
+}
+
+var ioBuf ioBufType
+
+func readData(name string, ioEnd chan string) {
+	var err error
+	ioBuf.inBuf, err = os.ReadFile(name)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ioEnd <- "ok"
+}
+
+func writeData(name string, ioEnd chan string) {
+	var err error
+	err = os.WriteFile(name, ioBuf.outBuf, 644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ioEnd <- "ok"
+}
+
+type parsedDataType struct {
+	firstRecord []byte
+	csvBlock    []byte
+	unpackedN   int
+}
+
+func parseData(buf []byte) parsedDataType {
+	result := parsedDataType{
+		firstRecord: nil,
+		csvBlock:    nil,
+		unpackedN:   0,
+	}
+	r, _ := regexp.Compile(".*")
+	allIndexes := r.FindAllIndex(buf, -1)
+	if len(allIndexes) < 2 {
+		return result
+	}
+	result.firstRecord = buf[allIndexes[0][0]:allIndexes[0][1]]
+	result.csvBlock = buf[allIndexes[1][0]:]
+
+	r, _ = regexp.Compile("\\d+")
+	rawN := r.Find(result.firstRecord)
+	result.unpackedN, _ = strconv.Atoi(string(rawN))
+
+	return result
+}
+
+type recordType struct {
+	lastName   string
+	firstName  string
+	patronymic string
+	birthDay   string
+	birthMonth string
+	birthYear  string
+}
+
+func validateRecord(idx int, record recordType) bool {
+	isValidIdx := idx <= maxN
+	isValidFirstName := len(record.firstName) >= minLenName && len(record.firstName) <= maxLenName
+	isValidLastName := len(record.lastName) >= minLenName && len(record.lastName) <= maxLenName
+	isValidPatronymic := len(record.patronymic) >= minLenName && len(record.patronymic) <= maxLenName
+
+	isValidDateOfBirth := true
+	d, _ := strconv.Atoi(record.birthDay)
+	m, _ := strconv.Atoi(record.birthMonth)
+	y, _ := strconv.Atoi(record.birthYear)
+	dateOfBirthStr := fmt.Sprintf("%02v.%02v.%04v", d, m, y)
+	dateOfBirth, err := time.Parse("02.01.2006", dateOfBirthStr)
+	if err != nil {
+		isValidDateOfBirth = false
+	} else {
+		minDate, _ := time.Parse("02.01.2006", minDateOfBirth)
+		maxDate, _ := time.Parse("02.01.2006", maxDateOfBirth)
+		if dateOfBirth.Before(minDate) || dateOfBirth.After(maxDate) {
+			isValidDateOfBirth = false
+		}
+	}
+	return isValidIdx && isValidFirstName && isValidLastName && isValidPatronymic && isValidDateOfBirth
+}
+
+func getHash(record recordType) string {
+	var differentSymbols int = 0
+	var sumDDMM int = 0
+	var indexFirstChar int = 0
+
+	chars := map[rune]struct{}{}
+	for _, c := range record.lastName {
+		chars[c] = struct{}{}
+	}
+	for _, c := range record.firstName {
+		chars[c] = struct{}{}
+	}
+	for _, c := range record.patronymic {
+		chars[c] = struct{}{}
+	}
+	differentSymbols = len(chars)
+
+	for _, d := range record.birthDay {
+		sumDDMM += int(d - '0')
+	}
+	for _, m := range record.birthMonth {
+		sumDDMM += int(m - '0')
+	}
+
+	upperLastName := strings.ToUpper(record.lastName)
+	indexFirstChar = int(upperLastName[0] - 'A' + 1)
+
+	resultHashInt := differentSymbols + 64*sumDDMM + 256*indexFirstChar
+	resultHash := fmt.Sprintf("%03X", resultHashInt)
+	if len(resultHash) > 3 {
+		resultHash = resultHash[len(resultHash)-3:]
+	}
+	return resultHash
+}
+
+func main() {
+	ioEnd := make(chan string)
+	go readData(inputFileName, ioEnd)
+	<-ioEnd
+
+	parsedData := parseData(ioBuf.inBuf)
+
+	var wgWorker, wgResult sync.WaitGroup
+	tasks := make(chan struct {
+		idx    int
+		record recordType
+	})
+	taskResults := make(chan struct {
+		idx  int
+		hash string
+	})
+	resultsMap := make(map[int]string)
+
+	for i := 0; i < nWorker; i++ {
+		wgWorker.Add(1)
+		go func() {
+			for task := range tasks {
+				if validateRecord(task.idx, task.record) {
+					taskResults <- struct {
+						idx  int
+						hash string
+					}{idx: task.idx,
+						hash: getHash(task.record)}
+				}
+			}
+			wgWorker.Done()
+		}()
+	}
+	wgResult.Add(1)
+	go func() {
+		for taskResult := range taskResults {
+			resultsMap[taskResult.idx] = taskResult.hash
+		}
+		wgResult.Done()
+	}()
+
+	csvReader := csv.NewReader(bytes.NewReader(parsedData.csvBlock))
+	csvReader.FieldsPerRecord = csvFieldsPerRecord
+	for i := 0; i < parsedData.unpackedN; i++ {
+		csvRecord, err := csvReader.Read()
+		if err != nil {
+			continue
+		}
+		record := recordType{
+			lastName:   csvRecord[0],
+			firstName:  csvRecord[1],
+			patronymic: csvRecord[2],
+			birthDay:   csvRecord[3],
+			birthMonth: csvRecord[4],
+			birthYear:  csvRecord[5],
+		}
+		tasks <- struct {
+			idx    int
+			record recordType
+		}{idx: i, record: record}
+	}
+	close(tasks)
+	wgWorker.Wait()
+	close(taskResults)
+	wgResult.Wait()
+
+	i := 0
+	resultIdxSlice := make([]int, len(resultsMap))
+	for idx, _ := range resultsMap {
+		resultIdxSlice[i] = idx
+		i++
+	}
+	sort.Stable(sort.IntSlice(resultIdxSlice))
+
+	results := make([]string, len(resultsMap))
+	for j, _ := range results {
+		results[j] = resultsMap[resultIdxSlice[j]]
+	}
+
+	ioBuf.outBuf = []byte(strings.Join(results, " "))
+
+	go writeData(outputFileName, ioEnd)
+	<-ioEnd
+}
